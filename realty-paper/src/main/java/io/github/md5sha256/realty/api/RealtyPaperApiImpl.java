@@ -46,6 +46,10 @@ public class RealtyPaperApiImpl implements RealtyPaperApi {
     private final SignTextApplicator signTextApplicator;
     private final SignCache signCache;
 
+    private record BackendWrite<T>(@NotNull T result,
+                                   @Nullable Map<String, String> placeholders) {
+    }
+
     public RealtyPaperApiImpl(@NotNull RealtyBackend realtyApi,
                               @NotNull Economy economy,
                               @NotNull ExecutorState executorState,
@@ -60,6 +64,15 @@ public class RealtyPaperApiImpl implements RealtyPaperApi {
         this.regionProfileService = regionProfileService;
         this.signTextApplicator = signTextApplicator;
         this.signCache = signCache;
+    }
+
+    private @Nullable Map<String, String> getRegionPlaceholdersAfterCommit(
+            @NotNull String regionId, @NotNull UUID worldId) {
+        try {
+            return realtyApi.getRegionPlaceholders(regionId, worldId);
+        } catch (RuntimeException ignored) {
+            return null;
+        }
     }
 
     // ═══════════════════════════════════════════════════
@@ -154,13 +167,12 @@ public class RealtyPaperApiImpl implements RealtyPaperApi {
         return CompletableFuture.supplyAsync(() -> {
             RealtyBackend.RentResult result = realtyApi.rentRegion(regionId, worldId, tenantId);
             if (result instanceof RealtyBackend.RentResult.Success) {
-                Map<String, String> placeholders = realtyApi.getRegionPlaceholders(regionId, worldId);
-                return Map.entry(result, placeholders);
+                return new BackendWrite<>(result, getRegionPlaceholdersAfterCommit(regionId, worldId));
             }
-            return Map.<RealtyBackend.RentResult, Map<String, String>>entry(result, Map.of());
-        }, executorState.dbExec()).thenComposeAsync(entry -> switch (entry.getKey()) {
+            return new BackendWrite<>(result, null);
+        }, executorState.dbExec()).thenComposeAsync(entry -> switch (entry.result()) {
             case RealtyBackend.RentResult.Success success ->
-                    handleRentPayment(region, regionId, worldId, tenantId, success, entry.getValue());
+                    handleRentPayment(region, regionId, worldId, tenantId, success, entry.placeholders());
             case RealtyBackend.RentResult.NoLeaseholdContract ignored ->
                     CompletableFuture.completedFuture(new RentResult.NoLeaseholdContract(regionId));
             case RealtyBackend.RentResult.AlreadyOccupied ignored ->
@@ -177,7 +189,7 @@ public class RealtyPaperApiImpl implements RealtyPaperApi {
             @NotNull WorldGuardRegion region, @NotNull String regionId,
             @NotNull UUID worldId, @NotNull UUID tenantId,
             @NotNull RealtyBackend.RentResult.Success reserved,
-            @NotNull Map<String, String> placeholders) {
+            @Nullable Map<String, String> placeholders) {
         double price = reserved.price();
         OfflinePlayer tenant = Bukkit.getOfflinePlayer(tenantId);
         // Region is already reserved in DB. Process payment, rollback DB on failure.
@@ -199,9 +211,11 @@ public class RealtyPaperApiImpl implements RealtyPaperApi {
         protectedRegion.getOwners().clear();
         protectedRegion.getMembers().clear();
         protectedRegion.getOwners().addPlayer(tenantId);
-        regionProfileService.applyFlags(region, RegionState.LEASED, placeholders);
-        signTextApplicator.updateLoadedSigns(region.world(), regionId,
-                RegionState.LEASED, placeholders);
+        if (placeholders != null) {
+            regionProfileService.applyFlags(region, RegionState.LEASED, placeholders);
+            signTextApplicator.updateLoadedSigns(region.world(), regionId,
+                    RegionState.LEASED, placeholders);
+        }
         return CompletableFuture.completedFuture(
                 new RentResult.Success(price, reserved.durationSeconds(),
                         regionId, reserved.landlordId()));
@@ -293,13 +307,12 @@ public class RealtyPaperApiImpl implements RealtyPaperApi {
         return CompletableFuture.supplyAsync(() -> {
             RealtyBackend.RenewLeaseholdResult result = realtyApi.renewLeasehold(regionId, worldId, tenantId);
             if (result instanceof RealtyBackend.RenewLeaseholdResult.Success) {
-                Map<String, String> placeholders = realtyApi.getRegionPlaceholders(regionId, worldId);
-                return Map.entry(result, placeholders);
+                return new BackendWrite<>(result, getRegionPlaceholdersAfterCommit(regionId, worldId));
             }
-            return Map.<RealtyBackend.RenewLeaseholdResult, Map<String, String>>entry(result, Map.of());
-        }, executorState.dbExec()).thenComposeAsync(entry -> switch (entry.getKey()) {
+            return new BackendWrite<>(result, null);
+        }, executorState.dbExec()).thenComposeAsync(entry -> switch (entry.result()) {
             case RealtyBackend.RenewLeaseholdResult.Success success ->
-                    handleExtendPayment(region, regionId, worldId, tenantId, success, entry.getValue());
+                    handleExtendPayment(region, regionId, worldId, tenantId, success, entry.placeholders());
             case RealtyBackend.RenewLeaseholdResult.NoLeaseholdContract ignored ->
                     CompletableFuture.completedFuture(new ExtendResult.NoLeaseholdContract(regionId));
             case RealtyBackend.RenewLeaseholdResult.NoExtensionsRemaining ignored ->
@@ -316,7 +329,7 @@ public class RealtyPaperApiImpl implements RealtyPaperApi {
             @NotNull WorldGuardRegion region, @NotNull String regionId,
             @NotNull UUID worldId, @NotNull UUID tenantId,
             @NotNull RealtyBackend.RenewLeaseholdResult.Success reserved,
-            @NotNull Map<String, String> placeholders) {
+            @Nullable Map<String, String> placeholders) {
         double price = reserved.price();
         OfflinePlayer tenant = Bukkit.getOfflinePlayer(tenantId);
         // Lease is already extended in DB. Process payment, rollback DB on failure.
@@ -334,8 +347,10 @@ public class RealtyPaperApiImpl implements RealtyPaperApi {
             OfflinePlayer landlord = Bukkit.getOfflinePlayer(reserved.landlordId());
             economy.depositPlayer(landlord, price);
         }
-        signTextApplicator.updateLoadedSigns(region.world(), regionId,
-                RegionState.LEASED, placeholders);
+        if (placeholders != null) {
+            signTextApplicator.updateLoadedSigns(region.world(), regionId,
+                    RegionState.LEASED, placeholders);
+        }
         return CompletableFuture.completedFuture(
                 new ExtendResult.Success(price, regionId));
     }
